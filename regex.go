@@ -1,8 +1,8 @@
-package main
+package fsm
 
 import (
-	"regexp/syntax"
 	"fmt"
+	"regexp/syntax"
 )
 
 // ParseRegex parses a regular expression and returns
@@ -14,8 +14,8 @@ import (
 // was designed to work on printable strings, the transitions
 // in the output NFA are "runes", which are equivalent to int32.
 func ParseRegex(pattern string) (*NFA, error) {
-	ast, err := syntax.Parse(string, syntax.POSIX)
-	if (err != nil) {
+	ast, err := syntax.Parse(pattern, syntax.POSIX)
+	if err != nil {
 		return nil, err
 	}
 	return astTraverse(ast)
@@ -50,7 +50,7 @@ func astTraverse(ast *syntax.Regexp) (*NFA, error) {
 	case syntax.OpNoWordBoundary:
 	case syntax.OpCapture:
 		// All of these features are incredibly useful for a normal regex library, but don't
-		// have much meaning or usefulness in the context of an NFA. 
+		// have much meaning or usefulness in the context of an NFA.
 		return nil, fmt.Errorf("Advanced regex operations not supported. See source for details")
 	case syntax.OpStar:
 		// now we're getting interesting!
@@ -58,12 +58,63 @@ func astTraverse(ast *syntax.Regexp) (*NFA, error) {
 		subexpNFA, err := astTraverse(ast.Sub[0])
 		// subexpNFA is a language that accepts ast.Sub[0]
 		// bubble up errors in recursion
-		if (err != nil) {
+		if err != nil {
 			return nil, err
 		}
 		return starNFA(subexpNFA), nil
+	case syntax.OpPlus:
+		// (regex)+ = regex(regex)*
+		subexpNFA, err := astTraverse(ast.Sub[0])
+		if err != nil {
+			return nil, err
+		}
+		return concatNFA(subexpNFA, starNFA(subexpNFA)), nil
+	case syntax.OpQuest:
+		// regex? = epsilon | regex
+		subexpNFA, err := astTraverse(ast.Sub[0])
+		if err != nil {
+			return nil, err
+		}
+		return unionNFA(emptyStringNFA(), subexpNFA), nil
+	case syntax.OpRepeat:
+		// not supported, not sure if i ever want to do this one
+		return nil, fmt.Errorf("Repeat operation not supported")
+	case syntax.OpConcat:
+		// this, along with star and union, is a fundamental operation
+		// on an nfa.
+		nfa_arr := make([]*NFA, len(ast.Sub))
+		for i := 0; i < len(ast.Sub); i++ {
+			result, err := astTraverse(ast.Sub[i])
+			if err != nil {
+				return nil, err
+			}
+			nfa_arr[i] = result
+		}
+		nfa_acc := nfa_arr[0]
+		// reduces from left to right
+		for i := 1; i < len(ast.Sub); i++ {
+			nfa_acc = concatNFA(nfa_acc, nfa_arr[i])
+		}
+		return nfa_acc, nil
+	case syntax.OpAlternate:
+		// NFA union operation
+		nfa_arr := make([]*NFA, len(ast.Sub))
+		for i := 0; i < len(ast.Sub); i++ {
+			result, err := astTraverse(ast.Sub[i])
+			if err != nil {
+				return nil, err
+			}
+			nfa_arr[i] = result
+		}
+		nfa_acc := nfa_arr[0]
+		for i := 1; i < len(ast.Sub); i++ {
+			nfa_acc = unionNFA(nfa_acc, nfa_arr[i])
+		}
+		return nfa_acc, nil
+	default:
+		return nil, fmt.Errorf("Unknown operation")
 	}
-	// INCOMPLETE
+	return nil, fmt.Errorf("Uknown operation")
 }
 
 // Creates a new NFA that accepts no strings.
@@ -78,8 +129,9 @@ func emptySetNFA() *NFA {
 func emptyStringNFA() *NFA {
 	// if an NFA tries to make a transition where there is none, it rejects.
 	n := NewNFA()
-	s1 := n.NewState()
-	s1.IsAccepting = true
+	s1, s2 := n.NewState(), n.NewState()
+	s1.NewEdge(Epsilon, s2)
+	s2.IsAccepting = true
 	return n
 }
 
@@ -88,7 +140,7 @@ func emptyStringNFA() *NFA {
 func literalStringNFA(runes []rune) *NFA {
 	n := NewNFA()
 	s_prev := n.NewState()
-	s_next := nil
+	var s_next *State
 	for r := range runes {
 		s_next = n.NewState()
 		s_prev.NewEdge(r, s_next)
@@ -100,7 +152,7 @@ func literalStringNFA(runes []rune) *NFA {
 
 func charClassNFA(runes []rune) *NFA {
 	// sanity checks for development
-	if len(runes) & 1 {
+	if (len(runes) & 1) != 0 {
 		panic("CharClass array not even, what is going on?!")
 	}
 	n := NewNFA()
@@ -111,8 +163,8 @@ func charClassNFA(runes []rune) *NFA {
 	// is the end of the range. There may be any number of
 	// pairs, so we count by 2.
 	for i := 0; i < len(runes); i += 2 {
-		for j := runes[i]; j <= runes[i + 1]; j++ {
-			s1.NewEdge(j, s2)
+		for j := runes[i]; j <= runes[i+1]; j++ {
+			s1.NewEdge(int(j), s2)
 		}
 	}
 	return n
@@ -120,8 +172,60 @@ func charClassNFA(runes []rune) *NFA {
 
 // Given an NFA as an input, returns an NFA that
 // accepts the language of the input NFA zero or more times
-func starNFA(nfa *NFA) (*NFA) {
-	// done hacking for a little while
+// See http://upload.wikimedia.org/wikipedia/commons/8/8e/Thompson-kleene-star.svg
+// for a drawing of this logic
+// This function clobbers the parameter.
+func starNFA(nfa *NFA) *NFA {
+	src, sink := nfa.NewState(), nfa.NewState()
+	src.NewEdge(Epsilon, nfa.Start())
+	src.NewEdge(Epsilon, sink)
+	for _, s := range nfa.List() {
+		if s.IsAccepting {
+			s.NewEdge(Epsilon, sink)
+			s.NewEdge(Epsilon, nfa.Start())
+		}
+	}
+	nfa.SetStart(src)
+	return nfa
 }
 
+// Given two NFAs as inputs, returns an NFA
+// that accepts the language of the first NFA
+// followed by the language of the second NFA.
+// This function clobbers the first parameter, and
+// fatally alters the second NFA. Neither should be
+// used after a call to this function.
+func concatNFA(first, second *NFA) *NFA {
+	// tell all of second's states that they belong to
+	// first now
+	for _, s := range second.List() {
+		s.nfa = first
+	}
+	// all accept states of the first NFA have epsilon
+	// transitions to the start state of second
+	for _, s := range first.List() {
+		if s.IsAccepting {
+			s.NewEdge(Epsilon, second.Start())
+		}
+	}
+	return first
+}
 
+// Given two NFAs as inputs, returns an NFA
+// that accepts the if a string is accepted
+// in either NFA. The parameters are clobbered the same
+// was as concatNFA.
+func unionNFA(first, second *NFA) *NFA {
+	src, sink := first.NewState(), first.NewState()
+	for _, s := range second.List() {
+		s.nfa = first
+	}
+	src.NewEdge(Epsilon, first.Start())
+	src.NewEdge(Epsilon, second.Start())
+	for _, s := range first.List() {
+		if s.IsAccepting {
+			s.NewEdge(Epsilon, sink)
+		}
+	}
+	return first
+}
