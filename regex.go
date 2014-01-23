@@ -22,6 +22,7 @@ func ParseRegex(pattern string) (*NFA, error) {
 }
 
 func astTraverse(ast *syntax.Regexp) (*NFA, error) {
+	fmt.Printf("AST node op: %d\n", ast.Op)
 	switch ast.Op {
 	case syntax.OpNoMatch:
 		// the language of ast is the empty set
